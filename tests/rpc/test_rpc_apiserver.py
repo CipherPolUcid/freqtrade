@@ -7,8 +7,10 @@ import logging
 import time
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 from pathlib import Path
-from unittest.mock import ANY, MagicMock, PropertyMock
+from unittest.mock import ANY, MagicMock, PropertyMock, patch
+from zipfile import ZipFile
 
 import pandas as pd
 import pytest
@@ -180,11 +182,12 @@ def test_api_ui_fallback(botclient, mocker):
     # Allow both fallback or real UI
     assert "`freqtrade install-ui`" in rc.text or "<!DOCTYPE html>" in rc.text
 
-    mocker.patch.object(Path, "is_file", MagicMock(side_effect=[True, False]))
-    rc = client_get(client, "%2F%2F%2Fetc/passwd")
-    assert rc.status_code == 200
+    for test_string in ["%2F%2F%2Fetc/passwd", "assets%2F..%2F..%2F..%2Fdeps.py"]:
+        with patch.object(Path, "is_file", MagicMock(side_effect=[True, False])):
+            rc = client_get(client, test_string)
+            assert rc.status_code == 200
 
-    assert "`freqtrade install-ui`" in rc.text
+            assert "`freqtrade install-ui`" in rc.text
 
 
 def test_api_ui_version(botclient, mocker):
@@ -1433,6 +1436,41 @@ def test_api_stats(botclient, mocker, ticker, fee, markets, is_short):
     assert "draws" in rc.json()["durations"]
 
 
+@pytest.mark.parametrize("is_short", [True, False])
+def test_api_historic_balance(botclient, mocker, ticker, fee, markets, is_short):
+    ftbot, client = botclient
+    patch_get_signal(ftbot, enter_long=not is_short, enter_short=is_short)
+    mocker.patch.multiple(
+        EXMS,
+        get_balances=MagicMock(return_value=ticker),
+        fetch_ticker=ticker,
+        get_fee=fee,
+        markets=PropertyMock(return_value=markets),
+    )
+
+    rc = client_get(client, f"{BASE_URI}/historic_balance")
+    assert_response(rc, 200)
+    resp = rc.json()
+    assert "columns" in resp
+    assert "data" in resp
+    assert "length" in resp
+    assert "capture_start_ts" in resp
+    assert resp["length"] == 0
+
+    ftbot.wallets.record_wallet_state()
+
+    rc = client_get(client, f"{BASE_URI}/historic_balance")
+    assert_response(rc, 200)
+    resp1 = rc.json()
+    assert "columns" in resp1
+    assert "data" in resp1
+    assert "length" in resp1
+    assert "capture_start_ts" in resp1
+    assert resp1["length"] == 1
+    assert "__date_ts" in resp1["columns"]
+    assert "total_quote" in resp1["columns"]
+
+
 def test_api_performance(botclient, fee):
     ftbot, client = botclient
     patch_get_signal(ftbot)
@@ -2421,6 +2459,31 @@ def test_api_pair_history(botclient, tmp_path, mocker):
     assert "enter_long" not in result["columns"]
     assert result["columns"] == ["date", "open", "high", "low", "close", "volume", "__date_ts"]
 
+    # Disallow base64 strategies
+    base64_dummy = "xx:cHJpbnQoImhlbGxvIHdvcmxkIik="
+    rc = client_post(
+        client,
+        f"{BASE_URI}/pair_history",
+        data={
+            "pair": "UNITTEST/BTC",
+            "timeframe": timeframe,
+            "timerange": "20180111-20180112",
+            "strategy": base64_dummy,
+            "columns": ["rsi", "fastd", "fastk"],
+        },
+    )
+    assert_response(rc, 422)
+    assert rc.json()["detail"] == "base64 encoded strategies are not allowed."
+
+    # Disallow base64 strategies
+    rc = client_get(
+        client,
+        f"{BASE_URI}/pair_history?pair=UNITTEST%2FBTC&timeframe={timeframe}"
+        f"&timerange=20200111-20200112&strategy={base64_dummy}",
+    )
+    assert_response(rc, 422)
+    assert rc.json()["detail"] == "base64 encoded strategies are not allowed."
+
 
 def test_api_pair_history_live_mode(botclient, tmp_path, mocker):
     _ftbot, client = botclient
@@ -2941,6 +3004,15 @@ def test_sysinfo(botclient):
     result = rc.json()
     assert "cpu_pct" in result
     assert "ram_pct" in result
+    assert "cpu_load" in result
+    assert "cpu_count" in result
+    assert "cpu_load_avg" in result
+    assert "1m" in result["cpu_load_avg"]
+    assert "5m" in result["cpu_load_avg"]
+    assert "15m" in result["cpu_load_avg"]
+
+    assert isinstance(result["cpu_load"], list)
+    assert isinstance(result["cpu_load"][0], dict)
 
 
 def test_api_backtesting(botclient, mocker, fee, caplog, tmp_path):
@@ -3078,7 +3150,7 @@ def test_api_backtesting(botclient, mocker, fee, caplog, tmp_path):
         # Disallow base64 strategies
         data["strategy"] = "xx:cHJpbnQoImhlbGxvIHdvcmxkIik="
         rc = client_post(client, f"{BASE_URI}/backtest", data=data)
-        assert_response(rc, 500)
+        assert_response(rc, 422)
     finally:
         Backtesting.cleanup()
 
@@ -3240,7 +3312,7 @@ def test_api_patch_backtest_history_entry(botclient, tmp_path: Path):
     assert fileres[CURRENT_TEST_STRATEGY]["notes"] == "FooBar"
 
 
-def test_api_patch_backtest_market_change(botclient, tmp_path: Path):
+def test_api_backtest_market_change(botclient, tmp_path: Path):
     ftbot, client = botclient
 
     # Create a temporary directory and file
@@ -3275,6 +3347,55 @@ def test_api_patch_backtest_market_change(botclient, tmp_path: Path):
     assert result["data"] == [
         ["2018-01-01T00:00:00Z", 2, 2555, 0.0, 1514764800000],
         ["2018-01-01T00:05:00Z", 4, 2556, 0.022, 1514765100000],
+    ]
+
+
+def test_api_backtest_wallets(botclient, tmp_path: Path):
+    ftbot, client = botclient
+
+    # Create a temporary directory and file
+    bt_results_base = tmp_path / "backtest_results"
+    bt_results_base.mkdir()
+    zip_file = bt_results_base / "backtest_15.zip"
+    with ZipFile(zip_file, "w") as zipf:
+        wallet_df = pd.DataFrame(
+            {
+                "date": [
+                    "2018-01-01T00:00:00Z",
+                    "2018-01-01T00:00:00Z",
+                    "2018-01-01T00:05:00Z",
+                    "2018-01-01T00:05:00Z",
+                ],
+                "currency": ["ETH", "BTC", "ETH", "BTC"],
+                "rate": [2000, 60_000, 2001, 60_001],
+                "balance": [0.5, 0.25, 0.5, 0.25],
+            }
+        )
+        wallet_df["date"] = pd.to_datetime(wallet_df["date"])
+        wallet_buf = BytesIO()
+        wallet_df.reset_index().to_feather(wallet_buf, compression_level=9, compression="lz4")
+        wallet_buf.seek(0)
+        zipf.writestr("backtest_15_SampleStrategy_wallet.feather", wallet_buf.read())
+
+    # Wrong basedirectory
+    rc = client_get(client, f"{BASE_URI}/backtest/history/randomFile.json/SampleStrategy/wallet")
+    assert_response(rc, 503)
+
+    ftbot.config["user_data_dir"] = tmp_path
+    ftbot.config["runmode"] = RunMode.WEBSERVER
+
+    # Nonexisting file - fails "is_file_in_dir" check
+    rc = client_get(client, f"{BASE_URI}/backtest/history/randomFile.json/SampleStrategy/wallet")
+    assert_response(rc, 400)
+
+    rc = client_get(client, f"{BASE_URI}/backtest/history/backtest_15/SampleStrategy/wallet")
+    assert_response(rc, 200)
+    result = rc.json()
+    assert result["length"] == 2
+    assert result["columns"] == ["date", "__date_ts", "total_quote"]
+    assert result["data"] == [
+        ["2018-01-01T00:00:00Z", 1514764800000, 16000.0],
+        ["2018-01-01T00:05:00Z", 1514765100000, 16000.75],
     ]
 
 

@@ -22,7 +22,13 @@ from freqtrade.rpc.api_server.api_schemas import (
     SysInfo,
     Version,
 )
-from freqtrade.rpc.api_server.deps import get_config, get_exchange, get_rpc, get_rpc_optional
+from freqtrade.rpc.api_server.deps import (
+    get_config,
+    get_exchange,
+    get_rpc,
+    get_rpc_optional,
+    verify_strategy,
+)
 from freqtrade.rpc.rpc import RPCException
 
 
@@ -63,7 +69,8 @@ logger = logging.getLogger(__name__)
 # 2.45: Add price to forceexit endpoint
 # 2.46: Add prepend_data to download-data endpoint
 # 2.47: Add Strategy parameters
-API_VERSION = 2.47
+# 2.48: add /backtest/history/wallets endpoint
+API_VERSION = 2.48
 
 # Public API, requires no auth.
 router_public = APIRouter()
@@ -71,9 +78,13 @@ router_public = APIRouter()
 router = APIRouter()
 
 
-@router_public.api_route("/ping", methods=["GET", "HEAD"], response_model=Ping, tags=["Info"])
+@router_public.get("/ping", response_model=Ping, tags=["Info"])
+@router_public.head("/ping", response_model=Ping, tags=["Info"])
 def ping():
-    """simple ping"""
+    """simple ping to check if API is responsive
+
+    Performs no internal checks, just returns pong.
+    """
     return {"status": "pong"}
 
 
@@ -146,8 +157,7 @@ def markets(
 def get_strategy(
     strategy: str, config=Depends(get_config), rpc: RPC | None = Depends(get_rpc_optional)
 ):
-    if ":" in strategy:
-        raise HTTPException(status_code=422, detail="base64 encoded strategies are not allowed.")
+    verify_strategy(strategy)
 
     if not rpc or config["runmode"] == RunMode.WEBSERVER:
         # webserver mode

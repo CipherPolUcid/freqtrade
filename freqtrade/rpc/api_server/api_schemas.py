@@ -255,6 +255,7 @@ class ShowConfig(BaseModel):
     timeframe_ms: int
     timeframe_min: int
     exchange: str
+    demo_trading: bool
     strategy: str | None = None
     force_entry_enable: bool
     exit_pricing: dict[str, Any]
@@ -679,6 +680,15 @@ class BacktestMarketChange(BaseModel):
     data: list[list[Any]]
 
 
+class WalletHistoryResponse(BaseModel):
+    columns: list[str]
+    length: int
+    data: list[list[Any]]
+    # start date of the effectively captured data
+    # Before this date, it's based on a reconstructed wallet history
+    capture_start_ts: int | None = None
+
+
 class MarketRequest(ExchangeModePayloadMixin, BaseModel):
     base: str | None = None
     quote: str | None = None
@@ -697,9 +707,25 @@ class MarketResponse(BaseModel):
     exchange_id: str
 
 
+class CpuInfo(BaseModel):
+    cpu: int
+    pct: float
+
+
 class SysInfo(BaseModel):
-    cpu_pct: list[float]
-    ram_pct: float
+    """Information about the system running the bot based on psutil output/measurements
+
+    Note: cpu_pct is deprecated and may be removed in a future release. Use cpu_load instead.
+    """
+
+    cpu_pct: list[float] = Field(
+        default=[], deprecated=True, description="Use cpu_load object instead"
+    )
+    cpu_load: list[CpuInfo]
+    cpu_load_avg: dict[str, float]
+    cpu_count: int = Field(description="Number of logical CPUs as provided by psutil")
+    cpu_avg: float = Field(description="Average CPU load across all cores as provided by psutil")
+    ram_pct: float = Field(description="RAM usage percentage as provided by psutil")
 
 
 class Health(BaseModel):

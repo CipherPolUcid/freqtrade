@@ -249,7 +249,7 @@ class Exchange:
 
         # Holds all open sell orders for dry_run
         self._dry_run_open_orders: dict[str, Any] = {}
-
+        self._is_demo_trading = exchange_conf.get("demo_trading", False)
         if self._config["dry_run"]:
             logger.info("Instance is running with dry_run enabled")
         logger.info(f"Using CCXT {ccxt.__version__}")
@@ -314,9 +314,12 @@ class Exchange:
         if self._exchange_ws:
             self._exchange_ws.cleanup()
         logger.debug("Exchange object destroyed, closing async loop")
-        generic_loop = asyncio.get_event_loop()
+        try:
+            generic_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            generic_loop = None
         loop_running = (getattr(self, "loop", None) and self.loop.is_running()) or (
-            generic_loop and generic_loop.is_running()
+            generic_loop is not None and generic_loop.is_running()
         )
 
         if (
@@ -362,6 +365,7 @@ class Exchange:
         self.validate_pricing(config["exit_pricing"])
         self.validate_pricing(config["entry_pricing"])
         self.validate_orderflow(config["exchange"])
+        self.validate_demo_trading(config["exchange"])
         self.validate_freqai(config)
 
         self._set_startup_candle_count(config)
@@ -415,6 +419,9 @@ class Exchange:
         except ccxt.BaseError as e:
             raise OperationalException(f"Initialization of ccxt failed. Reason: {e}") from e
 
+        if self.get_option("supports_demo_trading") and exchange_config.get("demo_trading", False):
+            api.enable_demo_trading(True)
+
         return api
 
     @property
@@ -430,12 +437,12 @@ class Exchange:
     @property
     def name(self) -> str:
         """exchange Name (from ccxt)"""
-        return self._api.name
+        return self._api.name if not self._is_demo_trading else f"{self._api.name} (Demo)"
 
     @property
     def id(self) -> str:
         """exchange ccxt id"""
-        return self._api.id
+        return self._api.id if not self._is_demo_trading else f"{self._api.id}_demo"
 
     @property
     def timeframes(self) -> list[str]:
@@ -822,7 +829,8 @@ class Exchange:
                 and order_types["stoploss_price_type"] not in price_mapping
             ):
                 raise ConfigurationError(
-                    f"On exchange stoploss price type is not supported for {self.name}."
+                    f"On exchange stoploss price type '{order_types['stoploss_price_type']}' "
+                    f"is not supported for {self.name}."
                 )
 
     def validate_pricing(self, pricing: dict) -> None:
@@ -865,6 +873,16 @@ class Exchange:
                 "Overriding exchange checks for freqAI. Make sure that your exchange supports "
                 "fetching historic OHLCV data, otherwise freqAI will not work."
             )
+
+    def validate_demo_trading(self, exchange_conf: dict) -> None:
+        """Validate demo trading configuration
+        Prevents accidental configuration with wrong expectations.
+        """
+        if exchange_conf.get("demo_trading", False):
+            if not self.get_option("supports_demo_trading"):
+                raise ConfigurationError(f"Demo trading is not supported for {self.name}.")
+            else:
+                logger.info(f"Demo trading enabled for {self.name}")
 
     def validate_required_startup_candles(self, startup_candles: int, timeframe: str) -> int:
         """
@@ -1893,9 +1911,12 @@ class Exchange:
         orders = []
         if self.exchange_has("fetchClosedOrders"):
             orders = self._api.fetch_closed_orders(pair, since=since_ms)
-            if self.exchange_has("fetchOpenOrders"):
-                orders_open = self._api.fetch_open_orders(pair, since=since_ms)
-                orders.extend(orders_open)
+        if self.exchange_has("fetchCanceledOrders"):
+            orders_canceled = self._api.fetch_canceled_orders(pair, since=since_ms)
+            orders.extend(orders_canceled)
+        if self.exchange_has("fetchOpenOrders"):
+            orders_open = self._api.fetch_open_orders(pair, since=since_ms)
+            orders.extend(orders_open)
         return orders
 
     @retrier(retries=0)
@@ -2648,11 +2669,11 @@ class Exchange:
         if self._can_use_websocket(self._exchange_ws, pair, timeframe, candle_type):
             candle_ts = dt_ts(timeframe_to_prev_date(timeframe))
             prev_candle_ts = dt_ts(date_minus_candles(timeframe, 1))
-            candles = self._exchange_ws.ohlcvs(pair, timeframe)
-            half_candle = int(candle_ts - (candle_ts - prev_candle_ts) * 0.5)
-            last_refresh_time = int(
-                self._exchange_ws.klines_last_refresh.get((pair, timeframe, candle_type), 0)
+            candles, last_refresh_time = self._exchange_ws.get_ohlcv_with_refresh(
+                pair, timeframe, candle_type
             )
+            last_refresh_time = int(last_refresh_time)
+            half_candle = int(candle_ts - (candle_ts - prev_candle_ts) * 0.5)
 
             if (
                 candles
@@ -3928,7 +3949,6 @@ class Exchange:
         is_short: bool,
         open_date: datetime,
         close_date: datetime,
-        time_in_ratio: float | None = None,
     ) -> float:
         """
         calculates the sum of all funding fees that occurred for a pair during a futures trade
@@ -3938,7 +3958,6 @@ class Exchange:
         :param is_short: trade direction
         :param open_date: The date and time that the trade started
         :param close_date: The date and time that the trade ended
-        :param time_in_ratio: Not used by most exchange classes
         """
         fees: float = 0
 

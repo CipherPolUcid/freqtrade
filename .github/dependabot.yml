@@ -1,8 +1,10 @@
 version: 2
 updates:
-- package-ecosystem: docker
-  cooldown:
-    default-days: 7
+- package-ecosystem: docker  # zizmor: ignore[dependabot-cooldown] Docker does not support cooldowns at the moment.
+  # Docker does not support cooldowns at the moment.
+  # https://github.com/dependabot/dependabot-core/issues/14044
+  # cooldown:
+  #   default-days: 7
   directories:
     - "/"
     - "/docker"
@@ -61,5 +63,7 @@ updates:
   groups:
     actions:
       patterns:
-        # Combine updates for github provided actions
         - "actions/*"
+    docker:
+      patterns:
+        - "docker/*"
